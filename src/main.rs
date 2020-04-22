@@ -88,7 +88,10 @@ impl Tx {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let db = Db::new("C:\\Users\\roust\\test.sqlite").await?;
+    let mut path = std::env::current_dir()?;
+    path.push("test.sqlite");
+
+    let db = Db::new(path.to_str().unwrap()).await?;
     db.init().await?;
 
     let mut tx = db.transaction().await?;
