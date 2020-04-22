@@ -1,16 +1,10 @@
-use log;
-use rusqlite::{params, Connection, Result};
-use std::path::PathBuf;
-
-#[derive(Debug, Clone)]
-pub enum Location {
-    Memory,
-    Persistent(PathBuf),
-}
+use sqlx::pool::PoolConnection;
+use sqlx::sqlite::SqliteQueryAs;
+use sqlx::{Result, SqliteConnection, SqlitePool};
 
 type AccountId = i64;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Account {
     id: i64,
     name: String,
@@ -26,97 +20,84 @@ impl Account {
 }
 
 struct Db {
-    location: Location,
+    pool: SqlitePool,
 }
 
 impl Db {
-    pub fn new(location: Location) -> Self {
-        Self { location }
+    pub async fn new(url: &str) -> Result<Self> {
+        let pool = SqlitePool::new(url).await?;
+        Ok(Self { pool })
     }
 
-    pub fn init(&self) -> Result<()> {
-        let conn = open_connection(&self.location)?;
-
-        conn.execute(
+    pub async fn init(&self) -> Result<()> {
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL
-    )",
-            params![],
-        )?;
+        )",
+        )
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
 
-    pub fn transaction(&self) -> Result<Transaction> {
-        Ok(Transaction::new(&self.location)?)
+    pub async fn transaction(&self) -> Result<Tx> {
+        let tx = self.pool.begin().await?;
+        Ok(Tx { tx })
     }
 }
 
-fn open_connection(location: &Location) -> Result<Connection> {
-    Ok(match location {
-        Location::Memory => Connection::open_in_memory(),
-        Location::Persistent(path) => Connection::open(path),
-    }?)
+pub struct Tx {
+    tx: sqlx::Transaction<PoolConnection<SqliteConnection>>,
 }
 
-pub struct Transaction {
-    conn: Connection,
-}
+impl Tx {
+    pub async fn add_account(&mut self, a: &Account) -> Result<AccountId> {
+        let rowid: (AccountId,) = sqlx::query_as(
+            r#"
+        INSERT INTO accounts (name) VALUES ($1);
+        SELECT last_insert_rowid();
+        "#,
+        )
+        .bind(&a.name)
+        .fetch_one(&mut self.tx)
+        .await?;
 
-impl Transaction {
-    pub fn new(location: &Location) -> Result<Self> {
-        let conn = open_connection(location)?;
-        conn.execute_batch("BEGIN TRANSACTION")?;
-        Ok(Self { conn })
+        Ok(rowid.0)
     }
 
-    pub fn add_account(&self, a: &Account) -> Result<AccountId> {
-        self.conn
-            .execute("INSERT INTO accounts (name) VALUES (?)", params![&a.name])?;
-        Ok(self.conn.last_insert_rowid())
+    pub async fn get_accounts(&mut self) -> Result<Vec<Account>> {
+        let rows: Vec<Account> = sqlx::query_as("SELECT id, name FROM accounts")
+            .fetch_all(&mut self.tx)
+            .await?;
+
+        Ok(rows)
     }
 
-    pub fn get_accounts(&self) -> Result<Vec<Account>> {
-        let mut stmt = self.conn.prepare("SELECT id, name FROM accounts")?;
-        let account_iter = stmt.query_map(params![], |row| {
-            Ok(Account {
-                id: row.get(0)?,
-                name: row.get(1)?,
-            })
-        })?;
-
-        Ok(account_iter.map(|a| a.unwrap()).collect())
+    pub async fn commit(self) -> Result<()> {
+        self.tx.commit().await?;
+        Ok(())
     }
 
-    pub fn commit(self) -> Result<()> {
-        Ok(self.conn.execute_batch("COMMIT")?)
-    }
-
-    pub fn rollback(&self) -> Result<()> {
-        Ok(self.conn.execute_batch("ROLLBACK")?)
+    pub async fn rollback(self) -> Result<()> {
+        self.tx.rollback().await?;
+        Ok(())
     }
 }
 
-impl Drop for Transaction {
-    fn drop(&mut self) {
-        if let Err(e) = self.rollback() {
-            log::error!("ROLLBACK failed: {}", e);
-        }
-    }
-}
+#[tokio::main]
+async fn main() -> Result<()> {
+    let db = Db::new("C:\\Users\\roust\\test.sqlite").await?;
+    db.init().await?;
 
-fn main() -> Result<()> {
-    let db = Db::new(Location::Persistent(PathBuf::from("test.sqlite")));
-    db.init()?;
+    let mut tx = db.transaction().await?;
+    tx.add_account(&Account::new("Account A1")).await?;
+    tx.add_account(&Account::new("Account A2")).await?;
+    tx.add_account(&Account::new("Account A3")).await?;
 
-    let tx = db.transaction()?;
-    tx.add_account(&Account::new("Account A1"))?;
-    tx.add_account(&Account::new("Account A2"))?;
-    tx.add_account(&Account::new("Account A3"))?;
-
-    let accounts = tx.get_accounts()?;
-    tx.commit()?;
+    let accounts = tx.get_accounts().await?;
+    tx.commit().await?;
 
     for account in accounts {
         println!("{:03} - {}", &account.id, &account.name);

@@ -8,5 +8,6 @@ edition = "2018"
 
 [dependencies]
 log = "0.4"
-tokio = "0.2"
-rusqlite = { version = "0.22", features = ["bundled"] }
+tokio = {version = "0.2", features = [ "macros", "rt-threaded" ] }
+#rusqlite = { version = "0.22", features = ["bundled"] }
+sqlx = { version = "0.3", default-features = false, features = [ "sqlite", "runtime-tokio", "macros" ] }
